@@ -1,0 +1,299 @@
+# =====================================================================
+# AI-Enabled FX Hedging Decision System for USD/PKR  -  SVR (version 2)
+# Direct multi-horizon SVR + walk-forward backtest.
+# Asks for the train file ONCE, then keeps asking for forecast month/year
+# until you type EXIT.
+# =====================================================================
+
+# ---------- 0. AUTO-INSTALL REQUIRED PACKAGES ----------
+import subprocess, sys, importlib
+
+REQUIRED = {"numpy": "numpy", "pandas": "pandas", "matplotlib": "matplotlib",
+            "sklearn": "scikit-learn", "openpyxl": "openpyxl"}
+for module, pip_name in REQUIRED.items():
+    try:
+        importlib.import_module(module)
+    except ImportError:
+        print(f"Installing {pip_name} ...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pip_name, "-q"])
+
+import os
+os.environ["LOKY_MAX_CPU_COUNT"] = "1"
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.svm import SVR
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
+
+warnings.filterwarnings("ignore")
+MONTHS = ["january", "february", "march", "april", "may", "june", "july",
+          "august", "september", "october", "november", "december"]
+MAX_HORIZON = 12          # months (SVR cannot be trusted further ahead with this much data)
+MIN_T = 6                 # first row usable for features (needs 6 months of history)
+WEIGHTS = (0.0, 0.25, 0.5)  # 0 = "no change", 0.5 = half of the SVR move; chosen by backtest
+
+
+class StopProgram(Exception):
+    pass
+
+
+def ask(prompt):
+    try:
+        text = input(prompt).strip()
+    except EOFError:
+        raise StopProgram
+    if text.lower() in ("exit", "quit", "q", "stop"):
+        raise StopProgram
+    return text
+
+
+# ---------- 1. ASK FOR TRAIN DATA FILE ----------
+def ask_for_file():
+    print("=" * 60)
+    print("STEP 1: Select your TRAIN DATA file (.xlsx / .xls / .csv)")
+    print("=" * 60)
+    path = ""
+    try:  # Google Colab
+        from google.colab import files  # type: ignore
+        return list(files.upload().keys())[0]
+    except Exception:
+        pass
+    try:  # Normal PC: file-picker window
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        path = filedialog.askopenfilename(
+            title="Select your train data file",
+            filetypes=[("Excel / CSV", "*.xlsx *.xls *.csv"), ("All files", "*.*")])
+        root.destroy()
+    except Exception:
+        path = ""
+    while not path or not os.path.exists(path):
+        path = ask("Type full path of your train data file: ").strip('"').strip("'")
+        if not os.path.exists(path):
+            print("File not found, try again.")
+    return path
+
+
+def load_data(path):
+    df = pd.read_csv(path) if path.lower().endswith(".csv") else pd.read_excel(path)
+    df.columns = [str(c).strip() for c in df.columns]
+    date_col = next(c for c in df.columns if "date" in c.lower())
+    df[date_col] = pd.to_datetime(df[date_col])
+    df = df.sort_values(date_col).reset_index(drop=True)
+    df[date_col] = df[date_col].dt.to_period("M").dt.to_timestamp()
+    return df, date_col
+
+
+# ---------- 2. ASK FOR FORECAST MONTH & YEAR ----------
+def ask_forecast_period(last_date):
+    print("\n" + "=" * 60)
+    print("Forecast period   (type EXIT any time to stop the program)")
+    print(f"Your data ends at {last_date:%B %Y}")
+    print("=" * 60)
+    while True:
+        m = ask("Forecast MONTH (name or number 1-12, e.g. March or 3): ").lower()
+        if m.isdigit() and 1 <= int(m) <= 12:
+            month = int(m)
+        else:
+            match = [i + 1 for i, n in enumerate(MONTHS) if n.startswith(m[:3])] if len(m) >= 3 else []
+            if not match:
+                print("Invalid month, try again.")
+                continue
+            month = match[0]
+        y = ask("Forecast YEAR (e.g. 2025): ")
+        if not y.isdigit():
+            print("Invalid year, try again.")
+            continue
+        target = pd.Timestamp(year=int(y), month=month, day=1)
+        if target <= last_date:
+            print(f"Please choose a month AFTER {last_date:%B %Y}.")
+            continue
+        steps = (target.year - last_date.year) * 12 + (target.month - last_date.month)
+        if steps > MAX_HORIZON:
+            print(f"Please choose a month within {MAX_HORIZON} months of {last_date:%B %Y}.")
+            continue
+        if steps > 6:
+            print("Note: forecasts more than 6 months ahead are less reliable.")
+        return target, steps
+
+
+# ---------- 3. DIRECT SVR FORECASTING ----------
+def own_feats(s, t):
+    """Momentum features from the variable's own history."""
+    return [s[t] - s[t - 1], s[t - 1] - s[t - 2], s[t] - s[t - 3], s[t] - s[t - 6]]
+
+
+def svr_delta(s, h, origin, feat_fn):
+    """Train an SVR (using only data known at `origin`) to predict s[t+h]-s[t]; return predicted change."""
+    ts = range(MIN_T, origin - h + 1)
+    X = np.array([feat_fn(t) for t in ts])
+    y = np.array([s[t + h] - s[t] for t in ts])
+    ysc = StandardScaler().fit(y.reshape(-1, 1))
+    model = make_pipeline(StandardScaler(), SVR(kernel="rbf", C=1.0, epsilon=0.1, gamma="scale"))
+    model.fit(X, ysc.transform(y.reshape(-1, 1)).ravel())
+    pred = model.predict(np.array([feat_fn(origin)]))
+    return float(ysc.inverse_transform(pred.reshape(-1, 1))[0, 0])
+
+
+def pick_and_forecast(s, h, variants, is_log, n):
+    """
+    Walk-forward backtest at horizon h: for every past origin, forecast h months ahead and compare
+    with what really happened. Choose the best (feature set, weight) and forecast from the last month.
+    """
+    first = max(30, int(0.6 * n))
+    origins = list(range(first, n - 1 - h))
+    back = lambda v: np.exp(v) if is_log else v
+    best = None
+    naive_mae = None
+    if len(origins) >= 6:
+        actual = np.array([back(s[o + h]) for o in origins])
+        naive = np.array([back(s[o]) for o in origins])
+        naive_mae = float(np.mean(np.abs(actual - naive)))
+        recency = np.linspace(0.3, 1.0, len(origins))   # recent months count more than the 2022-23 crisis
+        for name, fn in variants.items():
+            deltas = np.array([svr_delta(s, h, o, fn) for o in origins])
+            for w in WEIGHTS:
+                pred = np.array([back(s[o] + w * d) for o, d in zip(origins, deltas)])
+                err = pred - actual
+                score = float(np.average(np.abs(err), weights=recency))
+                if best is None or score < best["score"]:
+                    best = {"name": name, "w": w, "score": score,
+                            "mae": float(np.mean(np.abs(err))),
+                            "rmse": float(np.sqrt(np.mean(err ** 2))), "n": len(origins)}
+    if best is None:  # very short history: safe default
+        name = next(iter(variants))
+        best = {"name": name, "w": 0.25, "score": np.nan, "mae": np.nan, "rmse": np.nan, "n": 0}
+    fn = variants[best["name"]]
+    delta = svr_delta(s, h, n - 1, fn)
+    value = back(s[n - 1] + best["w"] * delta)
+    best["naive_mae"] = naive_mae
+    return float(value), best
+
+
+# ---------- 4. MAIN ----------
+def main():
+    path = ask_for_file()
+    df, date_col = load_data(path)
+    print(f"\nLoaded: {os.path.basename(path)}  |  {len(df)} rows  |  "
+          f"{df[date_col].min():%b %Y} to {df[date_col].max():%b %Y}")
+
+    target_col = next(c for c in df.columns if "usd/pkr" in c.lower())
+    feature_cols = [c for c in df.columns if c not in (date_col, target_col)]
+    df = df.dropna(subset=feature_cols + [target_col]).reset_index(drop=True)
+    n = len(df)
+
+    pak_cpi = next((c for c in feature_cols if "pakistan cpi" in c.lower()), None)
+    us_cpi = next((c for c in feature_cols if "us cpi" in c.lower()), None)
+    diff_col = next((c for c in feature_cols if "differential" in c.lower()), None)
+    derived = diff_col is not None and pak_cpi is not None and us_cpi is not None
+    base_factors = [c for c in feature_cols if not (derived and c == diff_col)]
+
+    last_date = df[date_col].iloc[-1]
+    last_actual = float(df[target_col].iloc[-1])
+    series = {c: df[c].values.astype(float) for c in feature_cols}
+    usd_log = np.log(df[target_col].values.astype(float))
+    FA = df[base_factors].values.astype(float)
+
+    short = {"reserve": "Foreign reserves", "reer": "REER", "brent": "Brent Crude Oil Price",
+             "policy": "SBP Policy rate", "federal funds": "Federal Funds Rate (midpoint)",
+             "pakistan cpi": "Pakistan CPI Inflation YoY (%)", "us cpi": "US CPI YoY Inflation (%)",
+             "differential": "Inflation rate differential"}
+
+    def nice(c):
+        for k, v in short.items():
+            if k in c.lower():
+                return v
+        return c
+
+    out_dir = os.path.join(os.path.dirname(os.path.abspath(path)), "SVR_Forecast_Output")
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except OSError:
+        out_dir = os.path.join(os.getcwd(), "SVR_Forecast_Output")
+        os.makedirs(out_dir, exist_ok=True)
+
+    cache = {}
+    try:
+        while True:
+            target_date, h = ask_forecast_period(last_date)
+            if h not in cache:
+                print(f"\nTraining SVR models for {h}-month horizon and running walk-forward backtest ...")
+                fc = {}
+                for c in base_factors:
+                    s = series[c]
+                    val, info = pick_and_forecast(s, h, {"own": lambda t, s=s: own_feats(s, t)}, False, n)
+                    if any(k in c.lower() for k in ("reserve", "reer", "brent", "policy")):
+                        val = max(val, 0.0)
+                    fc[c] = val
+                if derived:
+                    fc[diff_col] = fc[pak_cpi] - fc[us_cpi]
+                variants = {
+                    "own history": lambda t: own_feats(usd_log, t),
+                    "own history + factor changes": lambda t: own_feats(usd_log, t) + list(FA[t] - FA[t - 3]),
+                }
+                usd_val, usd_info = pick_and_forecast(usd_log, h, variants, True, n)
+                cache[h] = (fc, usd_val, usd_info)
+            fc, usd_fc, usd_info = cache[h]
+
+            last_tag = f"Last ({last_date:%b-%Y})"
+            fc_tag = f"Forecast {target_date:%b-%Y}"
+            names = [nice(c) for c in feature_cols] + [target_col]
+            lasts = [float(series[c][-1]) for c in feature_cols] + [last_actual]
+            fcs = [float(fc[c]) for c in feature_cols] + [usd_fc]
+            res = pd.DataFrame({"Factor": names, last_tag: np.round(lasts, 4), fc_tag: np.round(fcs, 4)})
+
+            print("\n" + "=" * 75)
+            print(f"FORECAST RESULT FOR {target_date:%B %Y}  (SVR)")
+            print("=" * 75)
+            print(res.to_string(index=False))
+            print("=" * 75)
+            if usd_info["n"] > 0:
+                print(f"Walk-forward backtest at {h}-month horizon ({usd_info['n']} past forecasts), USD/PKR:")
+                print(f"   SVR model MAE   : {usd_info['mae']:.2f} PKR   (RMSE {usd_info['rmse']:.2f})")
+                print(f"   'No change' MAE : {usd_info['naive_mae']:.2f} PKR   <- SVR must beat this")
+                print(f"   Model used: {usd_info['name']}, SVR weight {usd_info['w']}")
+
+            tag = f"{target_date:%b%Y}"
+            xlsx_path = os.path.join(out_dir, f"forecast_{tag}.xlsx")
+            png_path = os.path.join(out_dir, f"forecast_{tag}.png")
+            try:
+                with pd.ExcelWriter(xlsx_path, engine="openpyxl") as xw:
+                    res.to_excel(xw, index=False)
+                    ws = xw.sheets["Sheet1"]
+                    ws.column_dimensions["A"].width = 36
+                    ws.column_dimensions["B"].width = 18
+                    ws.column_dimensions["C"].width = 20
+            except PermissionError:
+                print(f"(Close the Excel file {xlsx_path} first, then run this month again.)")
+
+            plt.close("all")
+            plt.figure(figsize=(12, 6))
+            plt.plot(df[date_col], df[target_col], color="royalblue", lw=2, label="Historical USD/PKR")
+            plt.plot([last_date, target_date], [last_actual, usd_fc], color="darkorange",
+                     ls="--", lw=2.5, label="SVR forecast")
+            plt.scatter([target_date], [usd_fc], color="red", s=70, zorder=5)
+            plt.annotate(f"{usd_fc:.2f}", (target_date, usd_fc), textcoords="offset points",
+                         xytext=(0, 12), ha="center", fontsize=11)
+            plt.title(f"USD/PKR forecast for {target_date:%b-%Y} (SVR)")
+            plt.xlabel("Date"); plt.ylabel("USD/PKR"); plt.grid(True, alpha=0.3)
+            plt.legend(loc="upper left"); plt.tight_layout()
+            plt.savefig(png_path, dpi=150)
+            print(f"\nSaved:\n  {xlsx_path}\n  {png_path}")
+            try:
+                plt.show(block=False)
+                plt.pause(1)
+            except Exception:
+                pass
+            print("\n>>> Program is still running. Enter the next forecast month/year, or type EXIT. <<<")
+    except StopProgram:
+        print("\nProgram stopped. Files are saved in:", out_dir)
+        plt.close("all")
+
+
+if __name__ == "__main__":
+    main()
